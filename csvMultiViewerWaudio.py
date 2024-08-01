@@ -1,20 +1,22 @@
+import sys
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, Button
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable, get_cmap
-import glob
-from matplotlib.animation import FuncAnimation
+import pyqtgraph as pg
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtWidgets import QFileDialog
+from pyqtgraph.Qt import QtGui, QtCore
 import pygame
+import glob
+from pydub import AudioSegment
+from pydub.utils import mediainfo
 
-# Trilateration function
+# トリラテレーション関数
 def trilaterate(distances):
     beacon_positions = np.array([
-        [0, 0],      # Beacon A
-        [0, 10],     # Beacon B
-        [10, 10],    # Beacon C
-        [10, 0]      # Beacon D
+        [0, 0],      # ビーコンA
+        [0, 10],     # ビーコンB
+        [10, 10],    # ビーコンC
+        [10, 0]      # ビーコンD
     ])
     dA, dB, dC, dD = distances
     A = np.array([
@@ -40,115 +42,208 @@ def trilaterate(distances):
         return np.nan, np.nan
     return x, y
 
-# CSVファイルの読み込み
-folder_path = '/Users/rickshinmi/Desktop/wearable_club/dummydata/'
-csv_files = glob.glob(folder_path + '*.csv')
-dataframes = [pd.read_csv(file) for file in csv_files]
+# PyQtGraphアプリケーションの初期化
+app = QtWidgets.QApplication(sys.argv)
+win = pg.GraphicsLayoutWidget(show=True, title="Dance Visualization")
+win.resize(1000, 600)
+win.setWindowTitle('Dance Visualization')
 
-# タイムスタンプのリストを作成
-timestamps = pd.to_datetime(dataframes[0].iloc[:, 0])
+# より綺麗なプロットのためのアンチエイリアスを有効化
+pg.setConfigOptions(antialias=True)
 
-# pygameの初期化
-pygame.mixer.init()
-audio_file_path = '/Users/rickshinmi/Desktop/wearable_club/soundfile/Mad Tribe - Fake Guru - 01 Fake Guru.mp3'
-pygame.mixer.music.load(audio_file_path)
+# プロットの追加
+plot1 = win.addPlot(title="Position Plot")
+plot1.setXRange(-1, 11)
+plot1.setYRange(-1, 11)
 
-# プロットの設定
-fig, ax = plt.subplots()
-plt.subplots_adjust(left=0.1, bottom=0.35)
-ax.set_xlim(-1, 11)
-ax.set_ylim(-1, 11)
-ax.plot([0, 10], [0, 0], 'k-')  # X軸
-ax.plot([10, 10], [0, 10], 'k-')  # Y軸
-ax.plot([10, 0], [10, 10], 'k-')  # X軸
-ax.plot([0, 0], [10, 0], 'k-')  # Y軸
+plot2 = win.addPlot(title="Mean Dance Value")
+plot2.setYRange(0, 100)
 
-# カラーマップの設定
-cmap = get_cmap('viridis')
-norm = Normalize(vmin=0, vmax=100)
-sm = ScalarMappable(norm=norm, cmap=cmap)
-sm.set_array([])
+# 位置の散布図を作成
+scatter = pg.ScatterPlotItem(size=10, pen=pg.mkPen(None))
 
-# スライダーの設定
-ax_slider = plt.axes([0.1, 0.2, 0.65, 0.03], facecolor='lightgoldenrodyellow')
-slider = Slider(ax_slider, 'Time', 0, len(dataframes[0]) - 1, valinit=0, valstep=1, valfmt='%0.0f')
+# 平均ダンス値の折れ線グラフを作成
+curve = plot2.plot(pen='y')
+marker = plot2.plot([0], [0], pen=None, symbol='o', symbolBrush='r')
 
-# 再生ボタンの設定
-ax_button = plt.axes([0.8, 0.025, 0.1, 0.04])
-button = Button(ax_button, 'Play', color='lightgoldenrodyellow', hovercolor='0.975')
+# 時間選択用のスライダーを追加
+slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+slider.setRange(0, 0)
+proxy = QtWidgets.QGraphicsProxyWidget()
+proxy.setWidget(slider)
+win.nextRow()
+win.addItem(proxy)
 
-# フラグを管理するための変数
+# 再生ボタンの追加
+play_button = QtWidgets.QPushButton("Play")
+play_button_proxy = QtWidgets.QGraphicsProxyWidget()
+play_button_proxy.setWidget(play_button)
+win.nextRow()
+win.addItem(play_button_proxy)
+
+# フォルダ選択ボタンの追加
+folder_button = QtWidgets.QPushButton("Select Folder")
+folder_button_proxy = QtWidgets.QGraphicsProxyWidget()
+folder_button_proxy.setWidget(folder_button)
+win.nextRow()
+win.addItem(folder_button_proxy)
+
+# 音声ファイル選択ボタンの追加
+sound_button = QtWidgets.QPushButton("Select Sound")
+sound_button_proxy = QtWidgets.QGraphicsProxyWidget()
+sound_button_proxy.setWidget(sound_button)
+win.nextRow()
+win.addItem(sound_button_proxy)
+
+# チェックボックスリストを作成
+checkbox_layout = QtWidgets.QVBoxLayout()
+checkboxes = []
+checkbox_widget = QtWidgets.QWidget()
+checkbox_widget.setLayout(checkbox_layout)
+checkbox_proxy = QtWidgets.QGraphicsProxyWidget()
+checkbox_proxy.setWidget(checkbox_widget)
+win.nextRow()
+win.addItem(checkbox_proxy)
+
+# グローバル変数
 playing = False
 user_interaction = False
+dataframes = []
+file_names = []
+mean_dance = []
 
-def update(val):
-    global user_interaction
-    time_index = int(slider.val)
-    ax.clear()  # グラフのクリア
-    ax.plot([0, 10], [0, 0], 'k-')  # X軸
-    ax.plot([10, 10], [0, 10], 'k-')  # Y軸
-    ax.plot([10, 0], [10, 10], 'k-')  # X軸
-    ax.plot([0, 0], [10, 0], 'k-')  # Y軸
+def get_color(dance_value):
+    # ブルーからレッドへのグラデーション
+    blue = (0, 0, 255)
+    red = (255, 0, 0)
     
-    # 各データセットをプロット
-    for df in dataframes:
-        if time_index < len(df):
+    # ダンス値を0から100の範囲に正規化し、グラデーションの割合を計算
+    ratio = dance_value / 100.0
+    
+    # 比率に基づいてカラーを計算
+    color = (
+        int(blue[0] + (red[0] - blue[0]) * ratio),
+        int(blue[1] + (red[1] - blue[1]) * ratio),
+        int(blue[2] + (red[2] - blue[2]) * ratio)
+    )
+    
+    return color
+
+def update(time_index):
+    plot1.clear()
+    scatter.clear()
+    
+    positions = []
+    colors = []
+    
+    for df, checkbox in zip(dataframes, checkboxes):
+        if checkbox.isChecked() and time_index < len(df):
             distances = df.iloc[time_index, 1:5].values
             dance_value = df.iloc[time_index, 5]
             x, y = trilaterate(distances)
-            
-            if not np.isnan(x) and not np.isnan(y):  # NaNチェック
-                color = sm.to_rgba(dance_value)
-                ax.plot(x, y, 'o', color=color)  # 現在の位置をプロット
+            if not np.isnan(x) and not np.isnan(y):
+                color = get_color(dance_value)  # グラデーションカラーを使用
+                positions.append({'pos': (x, y), 'brush': pg.mkBrush(color=color)})
+    
+    scatter.addPoints(positions)
+    plot1.addItem(scatter)
+    
+    if len(mean_dance) > time_index:
+        mean_dance_value = mean_dance[time_index]
+        marker.setData([time_index], [mean_dance_value])
 
-    ax.set_xlim([-1, 11])
-    ax.set_ylim([-1, 11])
-    plt.draw()
-    # スライダーラベルをタイムスタンプに更新
-    slider.valtext.set_text(timestamps[time_index].strftime('%Y-%m-%d %H:%M:%S'))
-
-    # ユーザーがスライダーを動かした場合のみ音源再生の位置を変更
-    if user_interaction:
-        start_time_ms = time_index * 100  # 0.1秒ごとにサンプリングしているため
+    if user_interaction and playing:
+        start_time_ms = time_index * 100
         pygame.mixer.music.play(start=start_time_ms / 1000)
-        user_interaction = False
 
-def on_slider_change(val):
+def on_slider_change():
     global user_interaction
-    user_interaction = True
-    update(val)
+    if not playing:
+        user_interaction = False
+    update(slider.value())
 
-def play(event):
-    global playing
+def play():
+    global playing, user_interaction
     playing = not playing
+    user_interaction = True
     if playing:
-        button.label.set_text('Pause')
-        time_index = int(slider.val)
-        start_time_ms = time_index * 100  # 0.1秒ごとにサンプリングしているため
-        pygame.mixer.music.play(start=start_time_ms / 1000)
+        play_button.setText("Pause")
+        pygame.mixer.music.play()
     else:
-        button.label.set_text('Play')
+        play_button.setText("Play")
         pygame.mixer.music.stop()
 
-def animate(frame):
-    global playing
+def animate():
     if playing:
-        slider.set_val(slider.val + 1)
-        if slider.val >= len(dataframes[0]) - 1:
-            button.label.set_text('Play')
-            playing = False
+        current_value = slider.value()
+        if current_value < slider.maximum():
+            slider.setValue(current_value + 1)
+        else:
+            play()
+    QtCore.QTimer.singleShot(100, animate)
 
-button.on_clicked(play)
-slider.on_changed(on_slider_change)
+def select_folder():
+    folder_path = str(QFileDialog.getExistingDirectory(None, "Select Directory"))
+    if folder_path:
+        load_csv_files(folder_path)
 
-# カラーバーを追加
-cbar_ax = plt.axes([0.1, 0.02, 0.65, 0.03])
-cbar = plt.colorbar(sm, cax=cbar_ax, orientation='horizontal')
-cbar.set_label('Dance Value')
+def select_sound():
+    global audio_file_path
+    audio_file_path, _ = QFileDialog.getOpenFileName(None, "Select Sound File", "", "Audio Files (*.mp3 *.wav *.ogg)")
+    if audio_file_path:
+        load_sound_file(audio_file_path)
 
-# 初期ラベルをタイムスタンプに設定
-slider.valtext.set_text(timestamps[0].strftime('%Y-%m-%d %H:%M:%S'))
+def load_sound_file(audio_file_path):
+    audio_info = mediainfo(audio_file_path)
+    sample_rate = int(audio_info['sample_rate'])
+    channels = int(audio_info['channels'])
+    pygame.mixer.init(frequency=sample_rate, channels=channels)
+    pygame.mixer.music.load(audio_file_path)
 
-ani = FuncAnimation(fig, animate, frames=np.arange(0, len(dataframes[0])), interval=100)
+def load_csv_files(folder_path):
+    global dataframes, file_names, checkboxes, mean_dance
+    dataframes = []
+    file_names = []
+    checkboxes = []
+    checkbox_layout = checkbox_widget.layout()
+    
+    # 現在のチェックボックスを削除
+    for i in reversed(range(checkbox_layout.count())):
+        checkbox_layout.itemAt(i).widget().deleteLater()
 
-plt.show()
+    # 新しいファイルを読み込み
+    csv_files = glob.glob(folder_path + '/*.csv')
+    dataframes = [pd.read_csv(file) for file in csv_files]
+    file_names = [file.split('/')[-1] for file in csv_files]
+
+    # チェックボックスを作成
+    for file_name in file_names:
+        checkbox = QtWidgets.QCheckBox(file_name)
+        checkbox.setChecked(True)
+        checkboxes.append(checkbox)
+        checkbox_layout.addWidget(checkbox)
+
+    for checkbox in checkboxes:
+        checkbox.stateChanged.connect(on_checkbox_change)
+
+    if len(dataframes) > 0:
+        slider.setRange(0, len(dataframes[0]) - 1)
+        mean_dance = np.zeros(len(dataframes[0]))
+        for i in range(len(mean_dance)):
+            mean_dance[i] = np.mean([df.iloc[i, 5] for df in dataframes])
+        curve.setData(mean_dance)  # 平均ダンス値をプロット
+        update(0)
+
+def on_checkbox_change(state):
+    update(slider.value())
+
+slider.valueChanged.connect(on_slider_change)
+play_button.clicked.connect(play)
+folder_button.clicked.connect(select_folder)
+sound_button.clicked.connect(select_sound)
+
+animate()
+update(0)
+
+if __name__ == '__main__':
+    QtWidgets.QApplication.instance().exec_()
